@@ -1,13 +1,13 @@
 # Instructions
 
-Complete usage guide for **winDOHs Update Disabler**.
+Complete usage guide for **winDOHs Update Disabler v2.0**.
 
 ---
  
 ## Prerequisites
 
 - **Windows 10 or 11** (Home, Pro, Enterprise, or Education)
-- **Administrator privileges** — both scripts will refuse to run without elevation
+- **Administrator privileges** — both scripts auto-elevate via UAC if not already elevated
 - **No third-party dependencies** — everything uses built-in Windows tools
 
 ---
@@ -16,23 +16,30 @@ Complete usage guide for **winDOHs Update Disabler**.
 
 ### Disable Windows Update
 
-1. **Right-click** `DisableWindowsUpdate.bat` and select **Run as administrator**.
+1. **Double-click** `DisableWindowsUpdate.bat` — it will request admin privileges via a UAC prompt.
 2. A console window will appear with a menu:
    ```
    [1] INSTALL  - Disable & Block ALL Windows Updates
    [2] REVERT   - Re-enable Windows Updates
-   [3] EXIT
+   [3] STATUS   - Check current block status
+   [4] EXIT
    ```
 3. Type **`1`** and press **Enter**.
-4. The script runs through 8 steps. When you see **"ALL DONE — Windows Update has been DISABLED"**, press any key.
+4. The script runs through 12 steps. When you see **"ALL DONE — Windows Update has been DISABLED (12 layers)"**, press any key.
 5. **Reboot** your PC to fully apply all changes.
 
 ### Re-enable Windows Update
 
-1. Run the same script as administrator.
+1. Run the same script (it will auto-elevate).
 2. Choose **`2`** (REVERT).
-3. The script reverses every change made during install.
+3. The script reverses every change made during install (unlocks ACLs, restores services, removes hosts blocks, etc.).
 4. **Reboot** to complete restoration.
+
+### Check Status
+
+1. Run the same script.
+2. Choose **`3`** (STATUS).
+3. A colour-coded report shows green (blocked) or red (not blocked) for every protection layer.
 
 ---
 
@@ -40,22 +47,14 @@ Complete usage guide for **winDOHs Update Disabler**.
 
 ### Interactive Mode
 
-1. Open **PowerShell as Administrator**:
-   - Press `Win + X` → select **Windows Terminal (Admin)** or **PowerShell (Admin)**.
-2. Navigate to the script folder:
+1. **Double-click** `DisableWindowsUpdate.ps1` — it will auto-elevate via UAC prompt.
+   - Alternatively, open **PowerShell as Administrator** and run:
    ```powershell
    cd "C:\path\to\winDOHs-update-disabler"
-   ```
-3. If needed, allow script execution for the current session:
-   ```powershell
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-   ```
-4. Run the script:
-   ```powershell
    .\DisableWindowsUpdate.ps1
    ```
-5. Choose **[1] INSTALL** or **[2] REVERT** from the menu.
-6. **Reboot** after the script finishes.
+2. Choose **[1] INSTALL**, **[2] REVERT**, or **[3] STATUS** from the menu.
+3. **Reboot** after install or revert.
 
 ### Silent / Scripted Mode
 
@@ -77,7 +76,7 @@ This is useful for deployment scripts, remote management, or automation.
 
 Below is a breakdown of every layer applied during **INSTALL** and what **REVERT** does to undo it.
 
-### Step 1 — Stop & Disable Services
+### Step 1 — Stop Services
 
 | Service | Display Name |
 |---------|-------------|
@@ -87,19 +86,32 @@ Below is a breakdown of every layer applied during **INSTALL** and what **REVERT
 | `bits` | Background Intelligent Transfer Service |
 | `dosvc` | Delivery Optimization |
 | `uhssvc` | Microsoft Update Health Service |
+| `sedsvc` | Windows Remediation Service |
 
-**Install:** Services are stopped and their startup type is set to **Disabled**.
-**Revert:** Startup types are restored to their Windows defaults (Manual or Delayed-Auto) and services are started.
+**Install:** All 7 services are stopped.
+**Revert:** Services `bits`, `wuauserv`, `UsoSvc`, and `dosvc` are started.
 
-### Step 2 — Lock WaaSMedicSvc Self-Healing
+### Step 2 — Disable Services & Null Recovery Actions
 
-Windows uses WaaSMedicSvc to automatically repair and restart update services. This step overwrites its `FailureActions` registry value so Windows cannot auto-restart it.
+**Install:** All 7 services are set to **Disabled** (`Start = 4`). The `FailureActions` registry value for every service is overwritten with "do nothing" actions, preventing Windows from auto-restarting them on failure.
+**Revert:** Startup types are restored to Windows defaults (`Manual` for most, `Automatic (Delayed Start)` for `bits` and `dosvc`). `FailureActions` values are removed.
 
-**Revert:** The registry value is removed, restoring normal recovery behaviour.
+### Step 3 — ACL-Lock Service Registry Keys (Anti-Tamper)
 
-### Step 3 — Group Policy Registry Keys
+The three critical services (`wuauserv`, `UsoSvc`, `WaaSMedicSvc`) have their registry keys locked with Access Control Lists:
+- **Administrators** get Full Control
+- **SYSTEM** gets Read-only access
+- **SYSTEM** is DENIED `SetValue`, `CreateSubKey`, and `Delete`
 
-The following values are written under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`:
+This is the #1 defence against WaaSMedic self-healing — it physically cannot write the `Start` value back.
+
+Uses **SecurityIdentifier-based enumeration** to avoid crashes from orphaned SIDs in the registry.
+
+**Revert:** Deny rules are removed, SYSTEM gets Full Control restored, and inheritance is re-enabled.
+
+### Step 4 — Group Policy Registry Keys
+
+The following values are written under `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate` (and `\AU`):
 
 | Value | Effect |
 |-------|--------|
@@ -109,34 +121,54 @@ The following values are written under `HKLM\SOFTWARE\Policies\Microsoft\Windows
 | `DisableWindowsUpdateAccess = 1` | Removes access to Windows Update |
 | `SetDisableUXWUAccess = 1` | Hides the Windows Update UI |
 | `ExcludeWUDriversInQualityUpdate = 1` | Prevents driver updates |
+| `SetPolicyDrivenUpdateSourceForFeatureUpdates = 1` | Blocks feature update source |
+| `SetPolicyDrivenUpdateSourceForQualityUpdates = 1` | Blocks quality update source |
+| `DisableOSUpgrade = 1` | Prevents OS upgrades |
+| `ManagePreviewBuildsPolicyValue = 1` | Blocks preview/insider builds |
 
-**Revert:** All values are deleted from the registry.
+**Revert:** All values are deleted (including `TargetReleaseVersion` and `TargetReleaseVersionInfo`).
 
-### Step 4 — Disable Scheduled Tasks
+### Step 5 — Additional Registry Hardening
 
-13 tasks across three paths are disabled:
+| Key | Value | Effect |
+|-----|-------|--------|
+| `Schedule\Maintenance` | `MaintenanceDisabled = 1` | Stops automatic maintenance (triggers update scans) |
+| `WindowsStore` | `AutoDownload = 2` | Disables Store auto-updates |
+| `OSUpgrade` | `AllowOSUpgrade = 0` | Blocks OS upgrade via alternate codepath |
+| `WindowsUpdate` | `TargetReleaseVersion = 1` | Enables version lock |
+| `WindowsUpdate` | `TargetReleaseVersionInfo = <current>` | Locks to your current OS version (e.g. `23H2`) |
 
-- `\Microsoft\Windows\WindowsUpdate\*` (3 tasks)
-- `\Microsoft\Windows\UpdateOrchestrator\*` (9 tasks)
+After writing values, the script **ACL-locks 3 Group Policy registry keys** (`WindowsUpdate`, `WindowsUpdate\AU`, `WindowsStore`) with the same DENY-SYSTEM-write pattern used for service keys. This prevents the OS from reverting GP values.
+
+**Revert:** GP key ACLs are unlocked first, then all additional values are deleted.
+
+### Step 6 — Disable Scheduled Tasks
+
+20 tasks across three paths are disabled:
+
+- `\Microsoft\Windows\WindowsUpdate\*` — `Scheduled Start`, `sih`, `sihboot`
+- `\Microsoft\Windows\UpdateOrchestrator\*` — `Schedule Scan`, `Schedule Scan Static Task`, `UpdateModelTask`, `USO_UxBroker`, `Schedule Work`, `Schedule Wake To Work`, `Reboot_AC`, `Reboot_Battery`, `Report policies`, `Backup Scan`, `Schedule Maintenance Work`, `Universal Orchestrator Start`, `Universal Orchestrator Idle`, `UUS Failover Task`, `policyupdate`, `Start Oobe Expedite Work`
 - `\Microsoft\Windows\WaaSMedic\PerformRemediation`
 
-**Revert:** All tasks are re-enabled.
+**Revert:** All 20 tasks are re-enabled.
 
-### Step 5 — Block Update Domains via HOSTS File
+### Step 7 — Block Update Domains via HOSTS File
 
-16 Microsoft update domains are redirected to `0.0.0.0` in `%SystemRoot%\System32\drivers\etc\hosts`. Entries are wrapped in marker comments (`winDOHs-UPDATE-BLOCK-START` / `END`) for clean removal.
+30 Microsoft update domains are redirected to `0.0.0.0` in the system HOSTS file. Entries are wrapped in marker comments (`winDOHs-UPDATE-BLOCK-START` / `END`) for clean removal.
 
-**Revert:** Everything between the markers is removed from the HOSTS file.
+The script **stops the DNS Client service (Dnscache)** before writing to avoid file-lock failures, then restarts it after.
 
-### Step 6 — Rename SoftwareDistribution Folder
+**Revert:** Everything between the markers is removed. Dnscache is stopped/restarted during the write.
+
+### Step 8 — Rename SoftwareDistribution Folder
 
 The folder `%SystemRoot%\SoftwareDistribution` is renamed to `SoftwareDistribution.bak`, destroying the update cache.
 
 **Revert:** The folder is renamed back to `SoftwareDistribution`.
 
-### Step 7 — Outbound Firewall Rules
+### Step 9 — Outbound Firewall Rules
 
-Outbound block rules are created for these executables:
+Outbound block rules are created for 7 executables:
 
 | Rule Name | Blocked Program |
 |-----------|----------------|
@@ -145,14 +177,48 @@ Outbound block rules are created for these executables:
 | winDOHs Block UsoClient | `UsoClient.exe` |
 | winDOHs Block musNotify | `musNotification.exe` |
 | winDOHs Block musNotifyWorker | `musNotificationUx.exe` |
+| winDOHs Block UpdateAssist | `UpdateAssistant.exe` |
+| winDOHs Block sedLauncher | `sedlauncher.exe` |
 
-**Revert:** All five firewall rules are deleted.
+**Revert:** All 7 firewall rules are deleted.
 
-### Step 8 — Revoke UsoClient.exe Permissions *(PowerShell only)*
+### Step 10 — Revoke Execute Permissions on Update Binaries
 
-`UsoClient.exe` is the binary Windows calls to trigger update scans. The PowerShell script takes ownership and denies Read/Execute to `Everyone`.
+6 binaries have their execute permissions denied via `takeown` + `icacls /deny Everyone:(RX)`:
+
+`UsoClient.exe`, `WaaSMedicAgent.exe`, `wuauclt.exe`, `musNotification.exe`, `musNotificationUx.exe`, `sedlauncher.exe`
+
+**Revert:** Deny rules are removed, Read/Execute is granted, ownership is returned to `TrustedInstaller`.
+
+### Step 11 — Windows Update Assistant Cleanup
+
+If `%SystemRoot%\UpdateAssistant` exists, the script takes ownership and denies execute permissions to prevent the Update Assistant from running.
 
 **Revert:** Permissions are restored and ownership is returned to `TrustedInstaller`.
+
+### Step 12 — Flush DNS Cache
+
+`ipconfig /flushdns` is run to clear any cached DNS entries for the blocked update domains.
+
+---
+
+## Status Checker
+
+Both scripts include a **[3] STATUS** option that checks every protection layer and displays a colour-coded report:
+
+- **Green** = blocked / locked / present (protection active)
+- **Red** = not blocked / unlocked / missing (potential leak)
+
+Checks include:
+- All 7 services (status + startup type)
+- Service registry ACL lockdown (3 keys)
+- Group Policy ACL lockdown (3 keys)
+- Group Policy values (4 key values)
+- Additional registry values (maintenance, Store)
+- HOSTS file block markers
+- Firewall rules (all 7)
+- SoftwareDistribution folder state
+- Binary execute permissions (all 6)
 
 ---
 
@@ -160,10 +226,12 @@ Outbound block rules are created for these executables:
 
 | Problem | Solution |
 |---------|----------|
-| **"This script must be run as Administrator"** | Right-click → **Run as administrator** |
-| **PowerShell says "scripts are disabled"** | Run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first |
+| **UAC prompt doesn't appear** | Right-click → **Run as administrator** manually |
+| **PowerShell says "scripts are disabled"** | The script auto-elevates with `-ExecutionPolicy Bypass`. If running manually: `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` |
 | **Updates still appear after install** | Reboot — some changes only take effect after restart |
-| **A service keeps restarting** | Run the script again; WaaSMedic may have re-enabled services before reboot |
+| **A service keeps restarting** | Run STATUS to check — the ACL lockdown should prevent this. If still occurring, run INSTALL again |
+| **HOSTS file write fails** | The script stops Dnscache automatically. If it still fails, ensure no other program (e.g. antivirus) is locking the file |
+| **Registry writes fail (red warnings)** | Check that your user account has admin rights. The script verifies each write with a readback |
 | **Want to undo everything** | Run the same script and choose **REVERT**, then reboot |
 | **HOSTS file looks wrong after revert** | Open `%SystemRoot%\System32\drivers\etc\hosts` in Notepad (admin) and remove any leftover `0.0.0.0` lines manually |
 
@@ -179,3 +247,6 @@ A: Yes. The PowerShell script supports `-Mode Install` for silent deployment —
 
 **Q: Is a reboot really necessary?**
 A: Strongly recommended. Some services and scheduled tasks may still be in memory until the next restart.
+
+**Q: Are the BAT and PS1 scripts identical in function?**
+A: Yes. As of v2.0, both scripts apply the exact same 12 layers of protection with the same hardening. The only difference is the PS1 supports a `-Mode` parameter for scripted use and has a readback-verified registry write function.
